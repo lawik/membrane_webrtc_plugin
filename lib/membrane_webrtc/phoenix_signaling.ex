@@ -24,7 +24,7 @@ if Code.ensure_loaded?(Phoenix) do
     Registers Phoenix.Channel process as WebRTC signaling peer
     so that it can send and receive signaling messages.
     """
-    @spec register_channel(signaling_id(), pid() | nil) :: :ok
+    @spec register_channel(signaling_id(), pid() | nil) :: :ok | {:error, :busy}
     def register_channel(signaling_id, channel_pid \\ nil) do
       channel_pid = channel_pid || self()
       signaling = SignalingRegistry.get_or_create(signaling_id)

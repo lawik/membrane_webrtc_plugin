@@ -8,10 +8,18 @@ if Code.ensure_loaded?(Phoenix) do
     @impl true
     def join(signaling_id, _payload, socket) do
       signaling = PhoenixSignaling.Registry.get_or_create(signaling_id)
-      Process.monitor(signaling.pid)
-      Signaling.register_peer(signaling, message_format: :json_data, pid: self())
-      socket = assign(socket, signaling_id: signaling_id, signaling: signaling)
-      {:ok, socket}
+
+      case Signaling.register_peer(signaling, message_format: :json_data, pid: self()) do
+        :ok ->
+          Process.monitor(signaling.pid)
+          socket = assign(socket, signaling_id: signaling_id, signaling: signaling)
+          {:ok, socket}
+
+        {:error, :busy} ->
+          # The signaling already has its two peers, e.g. a browser and a Membrane element
+          # in an ongoing session; don't let another socket join it
+          {:error, %{reason: "busy"}}
+      end
     end
 
     @impl true

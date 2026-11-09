@@ -14,6 +14,8 @@ defmodule Membrane.WebRTC.Signaling do
   """
   use GenServer
 
+  require Logger
+
   alias ExWebRTC.{ICECandidate, SessionDescription}
 
   @enforce_keys [:pid]
@@ -109,9 +111,12 @@ defmodule Membrane.WebRTC.Signaling do
   - `pid` - pid of the peer, `self()` by default
   - `message_format` - `:ex_webrtc` by default, see `t:message_content/0`
 
+  Returns `{:error, :busy}` if two peers are already registered.
+
   See the moduledoc for details.
   """
-  @spec register_peer(t, message_format: :ex_webrtc | :json_data, pid: pid) :: :ok
+  @spec register_peer(t, message_format: :ex_webrtc | :json_data, pid: pid) ::
+          :ok | {:error, :busy}
   def register_peer(%__MODULE__{pid: pid}, opts \\ []) do
     opts =
       opts
@@ -161,13 +166,13 @@ defmodule Membrane.WebRTC.Signaling do
 
   @impl true
   def handle_call({:register_peer, peer}, _from, state) do
-    Process.monitor(peer.pid)
-
     case state do
       %{peer_a: nil} ->
+        Process.monitor(peer.pid)
         {:reply, :ok, %{state | peer_a: peer}}
 
       %{peer_b: nil, message_queue: queue} ->
+        Process.monitor(peer.pid)
         state = %{state | peer_b: peer}
 
         queue
@@ -179,10 +184,14 @@ defmodule Membrane.WebRTC.Signaling do
         {:reply, :ok, %{state | message_queue: []}}
 
       state ->
-        raise """
-        Cannot register a peer, both peers already registered: \
+        # Don't crash: this would tear down the session of the two registered peers,
+        # while the request may come from an unrelated (e.g. unauthenticated) process
+        Logger.warning("""
+        Cannot register peer #{inspect(peer.pid)}, both peers already registered: \
         #{inspect(state.peer_a.pid)}, #{inspect(state.peer_b.pid)}
-        """
+        """)
+
+        {:reply, {:error, :busy}, state}
     end
   end
 
@@ -193,22 +202,36 @@ defmodule Membrane.WebRTC.Signaling do
 
   @impl true
   def handle_info({:signal, from_pid, message, metadata}, state) do
-    {from_peer, to_peer} = get_peers(from_pid, state)
-    send_peer(from_peer, to_peer, message, metadata)
+    case get_peers(from_pid, state) do
+      {from_peer, to_peer} ->
+        send_peer(from_peer, to_peer, message, metadata)
+
+      nil ->
+        Logger.warning(
+          "Ignoring signaling message from unregistered process #{inspect(from_pid)}"
+        )
+    end
+
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:DOWN, _monitor, :process, pid, reason}, state) do
-    {peer, _other_peer} = get_peers(pid, state)
-    reason = if peer.is_element, do: reason, else: :normal
-    {:stop, reason, state}
+    case get_peers(pid, state) do
+      {peer, _other_peer} ->
+        reason = if peer.is_element, do: reason, else: :normal
+        {:stop, reason, state}
+
+      nil ->
+        {:noreply, state}
+    end
   end
 
   defp get_peers(pid, state) do
     case state do
       %{peer_a: %{pid: ^pid} = peer_a, peer_b: peer_b} -> {peer_a, peer_b}
       %{peer_a: peer_a, peer_b: %{pid: ^pid} = peer_b} -> {peer_b, peer_a}
+      _state -> nil
     end
   end
 
