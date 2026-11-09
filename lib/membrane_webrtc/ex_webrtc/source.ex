@@ -233,9 +233,65 @@ defmodule Membrane.WebRTC.ExWebRTCSource do
       ) do
     Membrane.Logger.debug("Received SDP offer")
 
-    {codecs_notification, state} = ensure_peer_connection_started(ctx, sdp, state)
-    :ok = PeerConnection.set_remote_description(state.pc, sdp)
+    case apply_offer(ctx, sdp, state) do
+      {:ok, codecs_notification, state} ->
+        handle_offer_applied(codecs_notification, metadata, state)
 
+      {:error, reason} ->
+        Membrane.Logger.warning("Ignoring invalid SDP offer: #{inspect(reason)}")
+        {[], state}
+    end
+  end
+
+  @impl true
+  def handle_info(
+        {:membrane_webrtc_signaling, _pid, %ICECandidate{} = candidate, _metadata},
+        _ctx,
+        state
+      ) do
+    case PeerConnection.add_ice_candidate(state.pc, candidate) do
+      :ok ->
+        {[], state}
+
+      # Workaround for a bug in ex_webrtc that should be fixed in 0.2.0
+      {:error, :no_remote_description} ->
+        {[], %{state | awaiting_candidates: [candidate | state.awaiting_candidates]}}
+
+      {:error, reason} ->
+        Membrane.Logger.warning("Ignoring invalid ICE candidate: #{inspect(reason)}")
+        {[], state}
+    end
+  end
+
+  @impl true
+  def handle_info(
+        {:DOWN, _monitor, :process, signaling_pid, _reason},
+        ctx,
+        %{signaling: %{pid: signaling_pid}} = state
+      ) do
+    if state.pc != nil do
+      PeerConnection.stop(state.pc)
+    end
+
+    handle_close(ctx, state)
+  end
+
+  @impl true
+  def handle_info(
+        {:DOWN, _monitor, :process, pc, _reason},
+        ctx,
+        %{pc: pc} = state
+      ) do
+    handle_close(ctx, state)
+  end
+
+  @impl true
+  def handle_tick({:request_keyframe, track_id}, _ctx, state) do
+    :ok = PeerConnection.send_pli(state.pc, track_id)
+    {[], state}
+  end
+
+  defp handle_offer_applied(codecs_notification, metadata, state) do
     {new_tracks, awaiting_outputs} =
       receive_new_tracks()
       |> Enum.map_reduce(state.awaiting_outputs, fn track, awaiting_outputs ->
@@ -285,53 +341,32 @@ defmodule Membrane.WebRTC.ExWebRTCSource do
     {codecs_notification ++ tracks_notification ++ stream_formats, state}
   end
 
-  @impl true
-  def handle_info(
-        {:membrane_webrtc_signaling, _pid, %ICECandidate{} = candidate, _metadata},
-        _ctx,
-        state
-      ) do
-    case PeerConnection.add_ice_candidate(state.pc, candidate) do
-      :ok ->
-        {[], state}
+  # Applies the remote offer, starting the peer connection if it is the first one.
+  # Returns an error instead of raising, as the offer comes from the remote peer
+  # (possibly unauthenticated, e.g. via WHIP), and leaves the state untouched in that case.
+  defp apply_offer(ctx, sdp, %{pc: nil} = state) do
+    with {:ok, video_codecs_in_sdp} <- ExWebRTCUtils.get_video_codecs_from_sdp(sdp) do
+      {codecs_notification, state} = start_peer_connection(ctx, video_codecs_in_sdp, state)
 
-      # Workaround for a bug in ex_webrtc that should be fixed in 0.2.0
-      {:error, :no_remote_description} ->
-        {[], %{state | awaiting_candidates: [candidate | state.awaiting_candidates]}}
+      case PeerConnection.set_remote_description(state.pc, sdp) do
+        :ok ->
+          {:ok, codecs_notification, state}
+
+        {:error, _reason} = error ->
+          # Don't keep a peer connection configured from a rejected offer
+          PeerConnection.stop(state.pc)
+          error
+      end
     end
   end
 
-  @impl true
-  def handle_info(
-        {:DOWN, _monitor, :process, signaling_pid, _reason},
-        ctx,
-        %{signaling: %{pid: signaling_pid}} = state
-      ) do
-    if state.pc != nil do
-      PeerConnection.stop(state.pc)
+  defp apply_offer(_ctx, sdp, state) do
+    with :ok <- PeerConnection.set_remote_description(state.pc, sdp) do
+      {:ok, [], state}
     end
-
-    handle_close(ctx, state)
   end
 
-  @impl true
-  def handle_info(
-        {:DOWN, _monitor, :process, pc, _reason},
-        ctx,
-        %{pc: pc} = state
-      ) do
-    handle_close(ctx, state)
-  end
-
-  @impl true
-  def handle_tick({:request_keyframe, track_id}, _ctx, state) do
-    :ok = PeerConnection.send_pli(state.pc, track_id)
-    {[], state}
-  end
-
-  defp ensure_peer_connection_started(ctx, sdp, %{pc: nil} = state) do
-    video_codecs_in_sdp = ExWebRTCUtils.get_video_codecs_from_sdp(sdp)
-
+  defp start_peer_connection(ctx, video_codecs_in_sdp, state) do
     negotiated_video_codecs =
       state.allowed_video_codecs
       |> Enum.filter(&(&1 in video_codecs_in_sdp))
@@ -358,8 +393,6 @@ defmodule Membrane.WebRTC.ExWebRTCSource do
     notify_parent = [notify_parent: {:negotiated_video_codecs, negotiated_video_codecs}]
     {notify_parent, %{state | pc: pc, video_params: video_params}}
   end
-
-  defp ensure_peer_connection_started(_ctx, _sdp, state), do: {[], state}
 
   defp maybe_answer(state) do
     if Enum.all?(state.output_tracks, fn {_id, %{status: status}} -> status == :connected end) do

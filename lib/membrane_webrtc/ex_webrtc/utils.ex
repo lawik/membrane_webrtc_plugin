@@ -96,24 +96,39 @@ defmodule Membrane.WebRTC.ExWebRTCUtils do
     end
   end
 
-  @spec get_video_codecs_from_sdp(ExWebRTC.SessionDescription.t()) :: [
-          :h264 | :h265 | :vp8 | :av1
-        ]
+  @spec get_video_codecs_from_sdp(ExWebRTC.SessionDescription.t()) ::
+          {:ok, [:h264 | :h265 | :vp8 | :av1]} | {:error, reason :: term()}
   def get_video_codecs_from_sdp(%ExWebRTC.SessionDescription{sdp: sdp}) do
-    ex_sdp = ExSDP.parse!(sdp)
-
-    ex_sdp.media
-    |> Enum.flat_map(fn
-      %{type: :video, attributes: attributes} -> attributes
-      _media -> []
-    end)
-    |> Enum.flat_map(fn
-      %ExSDP.Attribute.RTPMapping{encoding: "H264"} -> [:h264]
-      %ExSDP.Attribute.RTPMapping{encoding: "H265"} -> [:h265]
-      %ExSDP.Attribute.RTPMapping{encoding: "VP8"} -> [:vp8]
-      %ExSDP.Attribute.RTPMapping{encoding: "AV1"} -> [:av1]
-      _attribute -> []
-    end)
-    |> Enum.uniq()
+    with {:ok, ex_sdp} <- parse_sdp(sdp) do
+      ex_sdp.media
+      |> Enum.flat_map(fn
+        %{type: :video, attributes: attributes} -> attributes
+        _media -> []
+      end)
+      |> Enum.flat_map(fn
+        %ExSDP.Attribute.RTPMapping{encoding: "H264"} -> [:h264]
+        %ExSDP.Attribute.RTPMapping{encoding: "H265"} -> [:h265]
+        %ExSDP.Attribute.RTPMapping{encoding: "VP8"} -> [:vp8]
+        %ExSDP.Attribute.RTPMapping{encoding: "AV1"} -> [:av1]
+        _attribute -> []
+      end)
+      |> Enum.uniq()
+      |> then(&{:ok, &1})
+    end
   end
+
+  @doc """
+  Parses an SDP received from the remote peer, never raising.
+
+  `ExSDP.parse/1` still raises on some malformed lines (e.g. `v=abc`), which must not
+  take down the element or the server handling an untrusted peer.
+  """
+  @spec parse_sdp(term()) :: {:ok, ExSDP.t()} | {:error, reason :: term()}
+  def parse_sdp(sdp) when is_binary(sdp) do
+    ExSDP.parse(sdp)
+  rescue
+    error -> {:error, {:malformed_sdp, Exception.message(error)}}
+  end
+
+  def parse_sdp(_sdp), do: {:error, :malformed_sdp}
 end

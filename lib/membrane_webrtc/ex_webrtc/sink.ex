@@ -282,9 +282,11 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
   def handle_info(
         {:membrane_webrtc_signaling, _pid, %SessionDescription{type: :offer}, _metadata},
         _ctx,
-        _state
+        state
       ) do
-    raise "WebRTC sink received SDP offer, while it sends offer and expects an answer"
+    Membrane.Logger.warning("Ignoring SDP offer: WebRTC sink sends offer and expects an answer")
+
+    {[], state}
   end
 
   @impl true
@@ -294,11 +296,44 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
         state
       ) do
     Membrane.Logger.debug("Received SDP answer")
-    :ok = PeerConnection.set_remote_description(state.pc, sdp)
 
+    with {:ok, video_codecs} <- ExWebRTCUtils.get_video_codecs_from_sdp(sdp),
+         :ok <- PeerConnection.set_remote_description(state.pc, sdp) do
+      handle_answer_applied(video_codecs, state)
+    else
+      {:error, reason} ->
+        Membrane.Logger.warning("Ignoring invalid SDP answer: #{inspect(reason)}")
+        {[], state}
+    end
+  end
+
+  @impl true
+  def handle_info(
+        {:membrane_webrtc_signaling, _pid, %ICECandidate{} = candidate, _metadata},
+        _ctx,
+        state
+      ) do
+    case PeerConnection.add_ice_candidate(state.pc, candidate) do
+      :ok ->
+        {[], state}
+
+      {:error, reason} ->
+        Membrane.Logger.warning("Ignoring invalid ICE candidate: #{inspect(reason)}")
+        {[], state}
+    end
+  end
+
+  @impl true
+  def handle_info(
+        {:DOWN, _monitor, :process, signaling_pid, _reason},
+        _ctx,
+        %{signaling: %{pid: signaling_pid}} = state
+      ) do
+    {[], %{state | status: :closed}}
+  end
+
+  defp handle_answer_applied(video_codecs, state) do
     %{negotiating_tracks: negotiating_tracks, negotiated_tracks: negotiated_tracks} = state
-
-    video_codecs = ExWebRTCUtils.get_video_codecs_from_sdp(sdp)
 
     to_notify =
       negotiating_tracks |> Enum.filter(& &1.notify) |> Enum.map(&Map.take(&1, [:id, :kind]))
@@ -315,25 +350,6 @@ defmodule Membrane.WebRTC.ExWebRTCSink do
       |> maybe_negotiate_tracks()
 
     {actions, state}
-  end
-
-  @impl true
-  def handle_info(
-        {:membrane_webrtc_signaling, _pid, %ICECandidate{} = candidate, _metadata},
-        _ctx,
-        state
-      ) do
-    :ok = PeerConnection.add_ice_candidate(state.pc, candidate)
-    {[], state}
-  end
-
-  @impl true
-  def handle_info(
-        {:DOWN, _monitor, :process, signaling_pid, _reason},
-        _ctx,
-        %{signaling: %{pid: signaling_pid}} = state
-      ) do
-    {[], %{state | status: :closed}}
   end
 
   defp maybe_negotiate_tracks(%{negotiating_tracks: negotiating_tracks} = state)

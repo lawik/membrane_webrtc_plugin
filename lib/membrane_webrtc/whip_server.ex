@@ -108,6 +108,8 @@ defmodule Membrane.WebRTC.WhipServer do
     post "/" do
       with {:ok, token} <- get_token(conn),
            {:ok, offer_sdp, conn} <- get_body(conn, "application/sdp"),
+           # Reject malformed offers here, before they reach the pipeline
+           {:ok, _sdp} <- Membrane.WebRTC.ExWebRTCUtils.parse_sdp(offer_sdp),
            resource_id = generate_resource_id(),
            {:ok, client_handler} = ClientHandler.start_link(name: handler_name(resource_id)),
            {:ok, answer_sdp} <-
@@ -127,12 +129,11 @@ defmodule Membrane.WebRTC.WhipServer do
 
     patch "resource/:resource_id" do
       with {:ok, sdp, conn} <- get_body(conn, "application/trickle-ice-sdpfrag"),
-           sdp = ExSDP.parse!(sdp),
-           media = List.first(sdp.media),
-           {"candidate", candidate} <- ExSDP.get_attribute(media, "candidate") || :no_candidate do
-        {:ice_ufrag, ufrag} = ExSDP.get_attribute(sdp, :ice_ufrag)
-        {:mid, mid} = ExSDP.get_attribute(media, :mid)
-
+           {:ok, sdp} <- Membrane.WebRTC.ExWebRTCUtils.parse_sdp(sdp),
+           %ExSDP.Media{} = media <- List.first(sdp.media) || {:error, :no_media},
+           {"candidate", candidate} <- ExSDP.get_attribute(media, "candidate") || :no_candidate,
+           {:ice_ufrag, ufrag} <- ExSDP.get_attribute(sdp, :ice_ufrag) || {:error, :no_ice_ufrag},
+           {:mid, mid} <- ExSDP.get_attribute(media, :mid) || {:error, :no_mid} do
         candidate = %ExWebRTC.ICECandidate{
           candidate: candidate,
           sdp_mid: mid,
